@@ -14,6 +14,8 @@
 #include "nrf_drv_rng.h"
 #include "nrf_power.h"
 #include "nrf_pwr_mgmt.h"
+#include "nrf_sdh.h"
+#include "nrf_drv_clock.h"
 #include "nrfx_nfct.h"
 #include "nrfx_power.h"
 #include "nrf_drv_lpcomp.h"
@@ -281,6 +283,17 @@ static void button_init(void) {
  */
 static void system_off_enter(void) {
     ret_code_t ret;
+
+    // Check if NFCT field is currently detected (hardware register read).
+    // Prevents a race where the field is active but FIELD_DETECTED ISR hasn't
+    // run yet; entering system-off with the field present causes an immediate
+    // field-triggered reset. Instead, defer sleep — the NFCT event handler
+    // will restart the sleep timer via FIELD_LOST when appropriate.
+    if (NRF_NFCT->FIELDPRESENT & NFCT_FIELDPRESENT_FIELDPRESENT_Msk) {
+        sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
+        return;
+    }
+
     m_system_off_processing = true;
     // Save tag data
     tag_emulation_save();
@@ -348,8 +361,12 @@ static void system_off_enter(void) {
         // POWER_RAM_POWER_S3RETENTION_On << POWER_RAM_POWER_S3RETENTION_Pos |
         // POWER_RAM_POWER_S4RETENTION_On << POWER_RAM_POWER_S4RETENTION_Pos |
         POWER_RAM_POWER_S5RETENTION_On << POWER_RAM_POWER_S5RETENTION_Pos;
-    ret = sd_power_ram_power_set(8, ram8_retention);
-    APP_ERROR_CHECK(ret);
+    if (nrf_sdh_is_enabled()) {
+        ret = sd_power_ram_power_set(8, ram8_retention);
+        APP_ERROR_CHECK(ret);
+    } else {
+        NRF_POWER->RAM[8].POWER = ram8_retention;
+    }
 
     // IOs that need to be configured as floating analog inputs ==> no pull-up or pull-down
     uint32_t gpio_cfg_default_no_pull[] = {
@@ -403,8 +420,13 @@ static void system_off_enter(void) {
         // Close the comparator
         nrf_drv_lpcomp_disable();
         // Set the reason for Reset. After restarting, you need to get this reason to avoid misjudgment from the source of wake up.
-        sd_power_gpregret_clr(1, GPREGRET_CLEAR_VALUE_DEFAULT);
-        sd_power_gpregret_set(1, RESET_ON_LF_FIELD_EXISTS_Msk);
+        if (nrf_sdh_is_enabled()) {
+            sd_power_gpregret_clr(1, GPREGRET_CLEAR_VALUE_DEFAULT);
+            sd_power_gpregret_set(1, RESET_ON_LF_FIELD_EXISTS_Msk);
+        } else {
+            // sd_power_gpregret_set(1, ...) maps to GPREGRET2 (index 1 → offset 0x554).
+            NRF_POWER->GPREGRET2 = RESET_ON_LF_FIELD_EXISTS_Msk;
+        }
         // Trigger the RESET awakening system, restart the emulation process
         nrf_pwr_mgmt_shutdown(NRF_PWR_MGMT_SHUTDOWN_RESET);
         return;
@@ -416,7 +438,12 @@ static void system_off_enter(void) {
     // Go to system-off mode (this function will not return; wakeup will cause a reset).
     // Note that if you insert jlink or drive a Debug, you may report an error when entering the low power consumption.
     // When starting debugging, we should disable low power consumption state values, or simply not enter low power consumption
-    ret = sd_power_system_off();
+    if (nrf_sdh_is_enabled()) {
+        ret = sd_power_system_off();
+    } else {
+        nrf_power_system_off();
+        ret = NRF_SUCCESS;  // unreachable in production, but keeps static analysis happy
+    }
 
     // OK, here is very important. If you open the log output and enable RTT, you will not check the error of the low power mode
 #if !(NRF_LOG_ENABLED && NRF_LOG_BACKEND_RTT_ENABLED)
@@ -432,14 +459,21 @@ static void system_off_enter(void) {
 }
 
 /**
- *@brief :Detection of wake-up source
+ *@brief :Detection of wake-up source and SD state cleanup.
+ *
+ * Reset reason and GPREGRET values are read directly from hardware registers
+ * in main() before the SoftDevice init decision. This function only clears
+ * the corresponding SD-internal state when the SoftDevice is enabled, to keep
+ * its cached view of these registers consistent.
  */
 static void check_wakeup_src(void) {
-    sd_power_reset_reason_get(&m_reset_source);
-    sd_power_reset_reason_clr(m_reset_source);
-
-    sd_power_gpregret_get(1, &m_gpregret_val);
-    sd_power_gpregret_clr(1, GPREGRET_CLEAR_VALUE_DEFAULT);
+    // Reset reason was already read from hardware registers in main()
+    // before the SoftDevice init decision. When the SoftDevice is enabled,
+    // clear the registers via SD API to keep its internal state consistent.
+    if (nrf_sdh_is_enabled()) {
+        sd_power_reset_reason_clr(m_reset_source);
+        sd_power_gpregret_clr(1, GPREGRET_CLEAR_VALUE_DEFAULT);
+    }
 
 
     /*
@@ -973,7 +1007,7 @@ static void blink_usb_led_status(void) {
 }
 
 static void lesc_event_process(void) {
-    if (settings_get_ble_pairing_enable_first_load()) {
+    if (nrf_sdh_is_enabled() && settings_get_ble_pairing_enable_first_load()) {
         ret_code_t err_code;
         err_code = nrf_ble_lesc_request_handler();
         APP_ERROR_CHECK(err_code);
@@ -1000,7 +1034,43 @@ int main(void) {
     app_timers_init();        // Initialize soft timer
     power_management_init();  // Power management initialization
     usb_cdc_init();           // USB cdc emulation initialization
-    ble_slave_init();         // Bluetooth protocol stack initialization
+
+    // Read reset reason early (before SoftDevice init) so we can decide
+    // whether to skip BLE init for RF field wake.
+    // These direct register reads are equivalent to:
+    //   sd_power_reset_reason_get() → NRF_POWER->RESETREAS
+    //   sd_power_gpregret_get(1)   → NRF_POWER->GPREGRET2
+    m_reset_source = nrf_power_resetreas_get();
+    nrf_power_resetreas_clear(m_reset_source);
+    m_gpregret_val = NRF_POWER->GPREGRET2;
+    NRF_POWER->GPREGRET2 = 0;
+
+    bool is_rf_wake = (m_reset_source & (NRF_POWER_RESETREAS_NFC_MASK | NRF_POWER_RESETREAS_LPCOMP_MASK))
+                      || (m_gpregret_val & RESET_ON_LF_FIELD_EXISTS_Msk);
+
+    if (!is_rf_wake) {
+        ble_slave_init();         // Bluetooth protocol stack initialization
+    } else {
+        // Start LFCLK with internal RC for instant startup (vs 500ms XTAL delay).
+        // Then kick off async calibration so the RC achieves ±250ppm accuracy
+        // by the time tag emulation needs precise timing.
+        ret_code_t cal_err;
+        nrf_clock_lf_src_set(NRF_CLOCK_LFCLK_RC);
+        nrf_drv_clock_lfclk_request(NULL);
+        // RC oscillator starts near-instantly; timeout is a safety net in case
+        // of hardware fault (WDT is not yet initialized at this point).
+        for (uint32_t timeout = 10000; timeout > 0; timeout--) {
+            if (nrf_drv_clock_lfclk_is_running()) break;
+            nrf_delay_us(10);
+        }
+        if (!nrf_drv_clock_lfclk_is_running()) {
+            NVIC_SystemReset();
+        }
+        cal_err = nrf_drv_clock_calibration_start(0, NULL);
+        if (cal_err != NRF_SUCCESS) {
+            NRF_LOG_WARNING("LFCLK calibration start failed: %d", cal_err);
+        }
+    }
 
     rng_drv_and_srand_init(); // Random number generator initialization
     bsp_timer_init();         // Initialize timeout timer
@@ -1010,7 +1080,9 @@ int main(void) {
     tag_emulation_init();     // Analog card initialization
     rgb_marquee_init();       // Light effect initialization
 
-    ble_passkey_init();       // init ble connect key.
+    if (!is_rf_wake) {
+        ble_passkey_init();       // init ble connect key.
+    }
 
     // cmd callback register
     on_data_frame_complete(on_data_frame_received);

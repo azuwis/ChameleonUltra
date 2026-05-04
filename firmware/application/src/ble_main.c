@@ -588,6 +588,8 @@ static void whitelist_set(pm_peer_id_list_skip_t skip) {
 /**@brief Function for starting advertising.
  */
 void advertising_start(bool erase_bonds) {
+    if (!nrf_sdh_is_enabled()) return;
+
     if (erase_bonds == true && settings_get_ble_pairing_enable_first_load()) {
         // Advertising is started by PM_EVT_PEERS_DELETE_SUCCEEDED event.
         // So we don't call `ble_advertising_start()` after `delete_bonds_all()`.
@@ -605,6 +607,8 @@ void advertising_start(bool erase_bonds) {
  * @brief Function for stop advertising.
  */
 void advertising_stop(void) {
+    if (!nrf_sdh_is_enabled()) return;
+
     sd_ble_gap_adv_stop(m_advertising.adv_handle);
 }
 
